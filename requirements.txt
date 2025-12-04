@@ -1,0 +1,31 @@
+# SDS Neural Texturing - Requirements
+# NOTE: Install PyTorch and PyTorch3D manually first (see README.md)
+# They require matching CUDA versions!
+
+# Core ML
+# torch>=2.0.0  # Install separately with correct CUDA version
+# torchvision   # Install with torch
+# pytorch3d     # Install from source or prebuilt wheel
+
+# Diffusion Models
+diffusers>=0.24.0
+transformers>=4.36.0
+accelerate>=0.25.0
+
+# Optional but recommended
+xformers  # Memory efficient attention
+
+# Hugging Face
+huggingface_hub>=0.20.0
+
+# Utilities
+numpy>=1.24.0
+scipy>=1.11.0
+matplotlib>=3.7.0
+tqdm>=4.66.0
+
+# Build tools (for PyTorch3D from source)
+fvcore>=0.1.5
+iopath>=0.1.10
+ninja
+
