@@ -8,7 +8,7 @@ Generate high-quality textures for 3D meshes using Score Distillation Sampling (
 
 ### Prerequisites
 - NVIDIA GPU with CUDA support (recommended: 16GB+ VRAM for SDXL)
-- CUDA 11.8 or 12.1 (check with `nvcc --version` or `nvidia-smi`)
+- CUDA 11.6, 11.8, or 12.1 (check with `nvcc --version` or `nvidia-smi`)
 - Python 3.9 or 3.10 (recommended)
 
 ### Step 1: Check Your CUDA Version
@@ -32,15 +32,36 @@ conda activate sds-texture
 
 ### Step 3: Install PyTorch (Match Your CUDA Version!)
 
+**For CUDA 12.1:**
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+```
+
 **For CUDA 11.8:**
 ```bash
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 ```
 
-**For CUDA 12.1:**
+**For CUDA 11.6 (or 11.7):**
+
+CUDA is backward compatible within major versions. You have two options:
+
+*Option A: Try CUDA 11.8 wheels (often works!)*
 ```bash
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# Your 11.6 driver can often run code compiled for 11.8
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+
+# Test if it works
+python -c "import torch; print(torch.cuda.is_available())"
+# If this prints True, you're good!
 ```
+
+*Option B: Use PyTorch 1.13 with official CUDA 11.6 support (guaranteed compatible)*
+```bash
+pip install torch==1.13.1+cu116 torchvision==0.14.1+cu116 torchaudio==0.13.1 --extra-index-url https://download.pytorch.org/whl/cu116
+```
+
+> ⚠️ **Note for CUDA 11.6 users**: If Option A fails with CUDA errors, use Option B. PyTorch 1.13 is slightly older but fully functional for this project.
 
 **Verify PyTorch CUDA:**
 ```bash
@@ -158,10 +179,30 @@ python neural_texturing_sds.py
 - Reduce `render_resolution` (try 256 instead of 512)
 - Use `torch.cuda.empty_cache()` between iterations
 
+### CUDA 11.6 Specific Issues
+
+**"CUDA error: no kernel image is available for execution on the device"**
+```bash
+# This means the CUDA 11.8 wheels don't work with your 11.6
+# Fall back to PyTorch 1.13 with native 11.6 support:
+pip uninstall torch torchvision torchaudio -y
+pip install torch==1.13.1+cu116 torchvision==0.14.1+cu116 torchaudio==0.13.1 --extra-index-url https://download.pytorch.org/whl/cu116
+```
+
+**PyTorch3D with PyTorch 1.13 (CUDA 11.6)**
+```bash
+# For PyTorch 1.13, you may need an older PyTorch3D
+# Build from source with the correct branch:
+git clone https://github.com/facebookresearch/pytorch3d.git
+cd pytorch3d
+git checkout v0.7.2  # Compatible with PyTorch 1.13
+pip install -e .
+```
+
 ### PyTorch3D compilation errors
 ```bash
 # Make sure you have the right CUDA toolkit
-conda install -c nvidia cuda-toolkit=11.8  # or 12.1
+conda install -c nvidia cuda-toolkit=11.8  # or 11.6, 12.1
 
 # Set CUDA paths
 export CUDA_HOME=/usr/local/cuda

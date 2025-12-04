@@ -47,8 +47,11 @@ if [[ "$CUDA_VERSION" == 12.* ]]; then
 elif [[ "$CUDA_VERSION" == 11.8* ]] || [[ "$CUDA_VERSION" == 11.7* ]]; then
     echo "Installing PyTorch for CUDA 11.8"
     pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+elif [[ "$CUDA_VERSION" == 11.6* ]]; then
+    echo "Installing PyTorch 1.13 for CUDA 11.6"
+    pip install torch==1.13.1+cu116 torchvision==0.14.1+cu116 torchaudio==0.13.1 --extra-index-url https://download.pytorch.org/whl/cu116
 else
-    echo "Installing PyTorch for CUDA 11.8 (default)"
+    echo "Installing PyTorch for CUDA 11.8 (default - trying compatibility mode)"
     pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 fi
 
@@ -72,6 +75,13 @@ fi
 
 git clone https://github.com/facebookresearch/pytorch3d.git
 cd pytorch3d
+
+# For CUDA 11.6 with PyTorch 1.13, use compatible version
+if [[ "$CUDA_VERSION" == 11.6* ]]; then
+    echo "Using PyTorch3D v0.7.2 for PyTorch 1.13 compatibility"
+    git checkout v0.7.2
+fi
+
 pip install -e .
 cd ..
 
