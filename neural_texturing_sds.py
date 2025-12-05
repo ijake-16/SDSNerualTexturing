@@ -21,11 +21,11 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.optim import Adam
-
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 # Diffusers for SDXL
-from diffusers import StableDiffusionXLPipeline, DDPMScheduler
-
+from diffusers import StableDiffusionXLPipeline, DDPMScheduler, StableDiffusionPipeline, DDIMScheduler
+from torchvision.transforms import GaussianBlur
 # PyTorch3D for differentiable rendering
 from pytorch3d.structures import Meshes
 from pytorch3d.renderer import (
@@ -34,13 +34,18 @@ from pytorch3d.renderer import (
     MeshRenderer,
     MeshRasterizer,
     SoftPhongShader,
+    HardPhongShader,
     TexturesUV,
     PointLights,
     look_at_view_transform,
 )
 from pytorch3d.utils import ico_sphere
 
-
+def compute_tv_loss(img):
+    """이미지의 가로/세로 인접 픽셀 차이를 계산 (매끄러움 강제)"""
+    h_diff = img[:, :-1, :, :] - img[:, 1:, :, :]
+    w_diff = img[:, :, :-1, :] - img[:, :, 1:, :]
+    return torch.sum(torch.abs(h_diff)) + torch.sum(torch.abs(w_diff))
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -52,23 +57,25 @@ class Config:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # SDXL settings
-    model_id = "stabilityai/stable-diffusion-xl-base-1.0"
-    dtype = torch.float16
+    #model_id = "stabilityai/stable-diffusion-xl-base-1.0"
+    model_id = "Manojb/stable-diffusion-2-base"
+    
+    dtype = torch.float32
     
     # Texture settings
     texture_resolution = 1024  # UV texture map resolution
-    render_resolution = 512    # Rendered image resolution for SDS
+    render_resolution = 512   # Rendered image resolution for SDS
     
     # Mesh settings
     ico_sphere_level = 4  # Higher = more subdivisions = smoother sphere
     
     # Optimization settings
-    num_iterations = 1000
-    learning_rate = 0.01
+    num_iterations = 2000
+    learning_rate = 1e-2
     
     # SDS settings
-    guidance_scale = 100.0  # CFG scale for SDS
-    min_timestep = 20       # Minimum diffusion timestep
+    guidance_scale = 50.0   # CFG scale for SDS (Reduced from 100)
+    min_timestep = 200       # Minimum diffusion timestep
     max_timestep = 980      # Maximum diffusion timestep
     
     # Camera sampling
@@ -77,13 +84,135 @@ class Config:
     max_elevation = 60.0    # degrees
     
     # Text prompt for texture generation
-    prompt = "A peeling rusty metal sphere, highly detailed, 8k, photorealistic"
+    prompt = "a human head, highly detailed, 8k, photorealistic"
     negative_prompt = "blurry, low quality, distorted, ugly"
 
 
 # =============================================================================
 # SDXL Pipeline Wrapper
 # =============================================================================
+class SD2Wrapper:
+    """
+    Wrapper for Stable Diffusion 2.1 Base pipeline optimized for SDS.
+    """
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.device = config.device
+        self.dtype = config.dtype
+        
+        print(f"Loading SD2 pipeline: {config.model_id}...")
+        # SDXLPipeline -> StableDiffusionPipeline으로 변경
+        self.pipe = StableDiffusionPipeline.from_pretrained(
+            config.model_id,
+            torch_dtype=config.dtype,
+            use_safetensors=True,
+        )
+        self.pipe.to(self.device)
+        
+        # 메모리 절약을 위한 컴포넌트 고정
+        self.pipe.vae.requires_grad_(False)
+        self.pipe.unet.requires_grad_(False)
+        self.pipe.text_encoder.requires_grad_(False)
+        
+        # xformers 적용 (OOM 방지에 중요)
+        try:
+            self.pipe.enable_xformers_memory_efficient_attention()
+            print("xformers enabled")
+        except Exception:
+            print("xformers not available")
+        
+        self.scheduler = DDIMScheduler.from_config(self.pipe.scheduler.config)
+        self.num_train_timesteps = self.scheduler.config.num_train_timesteps
+        
+        self._encode_prompts()
+        
+        # SD2는 VAE 스케일링 팩터가 보통 0.18215
+        self.vae_scale_factor = self.pipe.vae.config.scaling_factor
+        
+    def _encode_prompts(self):
+        """Pre-encode text prompts."""
+        print("Encoding text prompts...")
+        
+        # SD2는 encode_prompt 반환값이 SDXL과 다름 (심플함)
+        # prompt_embeds shape: [B, 77, 768] (SDXL은 2048+)
+        self.prompt_embeds = self.pipe._encode_prompt(
+            self.config.prompt,
+            self.device,
+            num_images_per_prompt=1,
+            do_classifier_free_guidance=True,
+            negative_prompt=self.config.negative_prompt,
+        )
+        
+    def compute_sds_gradient(
+        self, 
+        latents: torch.Tensor,
+        timestep: int,
+    ) -> torch.Tensor:
+        """
+        Compute the SDS gradient for the given latents.
+        
+        SDS Gradient: ∇ = w(t) * (ε_pred - ε)
+        
+        Args:
+            latents: Clean latents from rendered image [B, 4, H//8, W//8]
+            timestep: Diffusion timestep
+            
+        Returns:
+            SDS gradient tensor
+        """
+        noise = torch.randn_like(latents)
+        timesteps = torch.tensor([timestep], device=self.device).long()
+        noisy_latents = self.scheduler.add_noise(latents, noise, timesteps)
+        
+        # 2. Input 준비
+        latent_model_input = torch.cat([noisy_latents] * 2)
+        latent_model_input = self.scheduler.scale_model_input(latent_model_input, timesteps)
+        
+        # 3. 예측
+        with torch.no_grad():
+            noise_pred = self.pipe.unet(
+                latent_model_input,
+                timesteps,
+                encoder_hidden_states=self.prompt_embeds,
+                return_dict=False,
+            )[0]
+
+        # 4. CFG
+        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+        noise_pred = noise_pred_uncond + self.config.guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+        # 5. SDS Gradient
+        w_t = 1.0
+        grad = w_t * (noise_pred - noise)
+
+        # ★ [추가] 디버깅을 위해 noise_pred도 함께 반환
+        return grad, noise_pred, noisy_latents
+
+    @torch.no_grad()
+    def decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        """Latent를 RGB 이미지로 디코딩 (현재 렌더링 상태 확인용)"""
+        # 스케일링 복구
+        latents = 1 / self.vae_scale_factor * latents
+        image = self.pipe.vae.decode(latents).sample
+        # [-1, 1] -> [0, 1]
+        image = (image / 2 + 0.5).clamp(0, 1)
+        return image
+
+    @torch.no_grad()
+    def decode_prediction(self, latents: torch.Tensor, noise_pred: torch.Tensor, timestep: int) -> torch.Tensor:
+        """
+        [수정 2] scheduler.step 대신 수식으로 직접 x0 추정 (디버그용)
+        Scheduler 설정이 꼬이는 것을 방지하기 위해 직접 수식 사용
+        x0 = (xt - sqrt(1-alpha_bar) * epsilon) / sqrt(alpha_bar)
+        """
+        alpha_prod_t = self.scheduler.alphas_cumprod[timestep]
+        beta_prod_t = 1 - alpha_prod_t
+        
+        # x0 prediction formula
+        pred_original_sample = (latents - beta_prod_t ** (0.5) * noise_pred) / alpha_prod_t ** (0.5)
+        
+        return self.decode_latents(pred_original_sample)
 
 class SDXLWrapper:
     """
@@ -104,7 +233,7 @@ class SDXLWrapper:
             variant="fp16",
         )
         self.pipe.to(self.device)
-        
+        self.pipe.vae.to(dtype=torch.float32)
         # Freeze all parameters
         self.pipe.unet.requires_grad_(False)
         self.pipe.vae.requires_grad_(False)
@@ -203,10 +332,11 @@ class SDXLWrapper:
         latent_model_input = self.scheduler.scale_model_input(latent_model_input, timesteps[0])
         
         # Prepare added conditions for SDXL
+        # Use 1024x1024 for original_size to encourage high-res features
         add_time_ids = self._get_add_time_ids(
-            original_size=(self.config.render_resolution, self.config.render_resolution),
+            original_size=(1024, 1024),
             crops_coords_top_left=(0, 0),
-            target_size=(self.config.render_resolution, self.config.render_resolution),
+            target_size=(Config.render_resolution, Config.render_resolution),
             dtype=self.dtype,
             batch_size=batch_size,
         )
@@ -238,6 +368,10 @@ class SDXLWrapper:
         
         return grad
     
+    
+
+    
+        
     def _get_add_time_ids(
         self,
         original_size: Tuple[int, int],
@@ -273,7 +407,7 @@ class DifferentiableRenderer:
             faces_per_pixel=1,
             # TODO: Adjust perspective_correct and cull_backfaces as needed
             perspective_correct=True,
-            cull_backfaces=False,
+            cull_backfaces=True,
         )
         
         # Setup lighting
@@ -329,7 +463,7 @@ class DifferentiableRenderer:
                 cameras=camera,
                 raster_settings=self.raster_settings,
             ),
-            shader=SoftPhongShader(
+            shader=HardPhongShader(
                 device=self.device,
                 cameras=camera,
                 lights=self.lights,
@@ -339,8 +473,8 @@ class DifferentiableRenderer:
         # Render
         images = renderer(mesh)  # [B, H, W, 4] (RGBA)
         
-        # Extract RGB and transpose to [B, 3, H, W]
-        images = images[..., :3].permute(0, 3, 1, 2)
+        # Permute to [B, 4, H, W]
+        images = images.permute(0, 3, 1, 2)
         
         # Clamp to valid range
         images = torch.clamp(images, 0.0, 1.0)
@@ -403,6 +537,10 @@ def create_textured_ico_sphere(
         textures=textures,
     )
     
+    # Explicitly set vertex normals for smooth shading
+    # We set the internal cache directly to ensure it's used
+    mesh._verts_normals_packed = verts_normalized
+    
     return mesh
 
 
@@ -446,14 +584,14 @@ def main():
     # -------------------------------------------------------------------------
     # Step 1: Initialize SDXL Pipeline
     # -------------------------------------------------------------------------
-    sdxl = SDXLWrapper(config)
+    sdxl = SD2Wrapper(config)
     
     # -------------------------------------------------------------------------
     # Step 2: Initialize Learnable Texture Map
     # -------------------------------------------------------------------------
     print("\nInitializing learnable texture map...")
     
-    # Initialize texture as grey with small random noise
+    # Initialize texture as green (tennis ball prior)
     # Shape: [1, H, W, 3] for TexturesUV
     texture_map = torch.ones(
         1, 
@@ -462,10 +600,11 @@ def main():
         3,
         device=config.device,
         dtype=torch.float32,
-    ) * 0.5
+    )*0.5
+    
     
     # Add small noise for initialization diversity
-    texture_map = texture_map + torch.randn_like(texture_map) * 0.1
+    # texture_map = texture_map + torch.randn_like(texture_map) * 0.1
     texture_map = torch.clamp(texture_map, 0.0, 1.0)
     
     # Make it a learnable parameter
@@ -480,8 +619,10 @@ def main():
     # -------------------------------------------------------------------------
     # Step 4: Setup Optimizer
     # -------------------------------------------------------------------------
-    optimizer = Adam([texture_map], lr=config.learning_rate)
-    
+    # optimizer = Adam([texture_map], lr=config.learning_rate)
+    optimizer = AdamW([texture_map], lr=config.learning_rate, weight_decay=0.0)
+    scheduler = CosineAnnealingLR(optimizer, T_max=config.num_iterations, eta_min=0.001)
+    blurrer = GaussianBlur(kernel_size=(9, 9), sigma=(2.0, 2.0))
     # -------------------------------------------------------------------------
     # Step 5: Optimization Loop
     # -------------------------------------------------------------------------
@@ -502,6 +643,7 @@ def main():
         # ----- Create Mesh with Current Texture -----
         # Clamp texture to valid range
         texture_clamped = torch.clamp(texture_map, 0.0, 1.0)
+        # texture_flipped = torch.flip(texture_clamped, [1])
         mesh = create_textured_ico_sphere(
             level=config.ico_sphere_level,
             texture_map=texture_clamped,
@@ -509,26 +651,28 @@ def main():
         )
         
         # ----- Render -----
-        rendered_image = renderer.render(mesh, camera)  # [1, 3, H, W]
+        # rendered_image = renderer.render(mesh, camera)  # [1, 4, H, W]
+        rendered_image_raw = renderer.render(mesh, camera)
         
+        rgb = rendered_image_raw[:, :3, :, :]
+        mask = rendered_image_raw[:, 3:4, :, :]
+        bg_color = torch.tensor([0.5, 0.5, 0.5], device=config.device).view(1, 3, 1, 1)
+        rendered_image = rgb * mask + bg_color * (1 - mask)
         # ----- SDS Loss Computation -----
         # Encode rendered image to latents (with gradient tracking)
         # IMPORTANT: We need gradients to flow from loss -> latents -> rendered_image -> texture
         
         # Resize if needed (KEEP GRADIENTS - no torch.no_grad()!)
-        if rendered_image.shape[-1] != config.render_resolution:
-            rendered_image_resized = F.interpolate(
-                rendered_image,
-                size=(config.render_resolution, config.render_resolution),
-                mode='bilinear',
-                align_corners=False,
-            )
-        else:
-            rendered_image_resized = rendered_image
-        
+        rendered_image_resized = F.interpolate(
+            rendered_image,
+            size=(Config.render_resolution,Config.render_resolution),
+            mode='bilinear',
+            align_corners=False,
+        )
+
         # Normalize to [-1, 1] for VAE (keep gradients!)
         rendered_for_vae = 2.0 * rendered_image_resized - 1.0
-        rendered_for_vae = rendered_for_vae.to(dtype=config.dtype)
+        rendered_for_vae = rendered_for_vae.to(dtype=config.dtype).contiguous()
         
         # Encode to latents - use .mode() instead of .sample() for deterministic 
         # encoding that properly passes gradients (sample() has stochastic issues)
@@ -539,10 +683,16 @@ def main():
         # Sample random timestep
         # TODO: Experiment with timestep sampling strategies
         timestep = random.randint(config.min_timestep, config.max_timestep)
+
+        # t_ratio = iteration / config.num_iterations
+        # t_range = config.max_timestep - config.min_timestep
+        # current_t = config.max_timestep - int(t_range * t_ratio * 0.8) # 너무 작은 t는 피함
+        # timestep = random.randint(max(config.min_timestep, current_t - 200), current_t)
         
         # Compute SDS gradient (this is computed without gradients - it's our "target")
-        sds_grad = sdxl.compute_sds_gradient(latents.detach(), timestep)
-        
+        sds_grad, noise_pred, noisy_latents = sdxl.compute_sds_gradient(latents.detach(), timestep)
+        sds_grad = sds_grad.to(dtype=torch.float32)
+        # sds_grad = blurrer(sds_grad)  # Removed aggressive blur
         # ----- Backpropagation -----
         # SDS gradient update: we want to move latents in the direction of sds_grad
         # The trick: loss = latents · stop_gradient(sds_grad)
@@ -550,8 +700,40 @@ def main():
         # 
         # Mathematically: ∂L/∂texture = ∂latents/∂texture · sds_grad
         # This backprops the SDS gradient through: latents -> VAE -> rendered_image -> texture
-        loss = (latents * sds_grad.detach()).sum()
-        loss.backward()
+        #####################
+        # [수정 전]
+        # loss = (latents * sds_grad.detach()).sum()
+        # loss.backward()
+
+        # [수정 후] -> 이 방식으로 변경!
+        # SDS 그래디언트를 latents에 직접 주입하여 텍스처까지 역전파
+
+        # grad_mag = sds_grad.norm()
+        # if grad_mag > 1.0:
+        #     sds_grad = sds_grad / grad_mag  # Normalize to unit norm if too large
+        
+        # Apply a constant scale factor to control update size
+        sds_grad = sds_grad * 0.3  # Reduced scale to prevent noisy updates
+        loss_sds = (latents * sds_grad.detach()).sum()
+
+        # TV Loss 가중치 설정 (보통 0.01 ~ 0.1 사이, 노이즈가 심하면 키우세요)
+        # tv_weight = 1e-5
+        # loss_tv = compute_tv_loss(texture_map) * tv_weight
+
+        # 최종 Loss 합산
+        # loss = loss_tv
+        optimizer.zero_grad() # 기울기 초기화
+        # latents.backward(gradient=sds_grad, retain_graph=True)
+        tv_weight = 1e-5
+        loss_tv = compute_tv_loss(texture_map) * tv_weight
+        loss_total = loss_tv+loss_sds
+        loss_total.backward()
+        optimizer.step()
+        scheduler.step()
+        loss = loss_total
+
+        
+        ##################
         
         # ----- Verify Gradient Flow (first iteration only) -----
         if not gradient_verified:
@@ -564,7 +746,7 @@ def main():
                 print(f"  - latents requires_grad: {latents.requires_grad}")
         
         # ----- Optimizer Step -----
-        optimizer.step()
+        # optimizer.step()
         
         # ----- Logging -----
         if iteration % 50 == 0 or iteration == config.num_iterations - 1:
@@ -583,10 +765,26 @@ def main():
         # ----- Save Intermediate Results -----
         # TODO: Add checkpointing and visualization saving
         if iteration % 100 == 0:
-            # Save texture map
-            texture_save = torch.clamp(texture_map.detach(), 0.0, 1.0)
-            # Could save to file here
-            pass
+            print(f"Saving debug images at iter {iteration}...")
+            with torch.no_grad():
+                # 1. 현재 렌더링된 모습 (VAE가 잘 동작하는지 확인)
+                # 3D 렌더러 -> VAE Encode -> VAE Decode 과정을 거친 이미지
+                # 이게 노이즈라면 렌더러나 VAE 입력 범위(-1~1) 문제
+                current_view_img = sdxl.decode_latents(latents.detach())
+                
+                # 2. AI가 상상하는 목표 모습 (x0 prediction)
+                # "이 노이즈를 제거하면 이런 얼굴이 될 거야"라고 모델이 생각하는 이미지
+                # 이게 괴상하면 프롬프트가 이상하거나 CFG가 너무 높은 것
+                target_view_img = sdxl.decode_prediction(noisy_latents, noise_pred, timestep).cpu()
+                
+                # 저장
+                from torchvision.utils import save_image
+                save_image(current_view_img, f"debug_iter_{iteration:04d}_current.png")
+                save_image(target_view_img, f"debug_iter_{iteration:04d}_target_prediction.png")
+                
+                # 텍스처 맵도 저장
+                save_image(texture_map.detach().permute(0, 3, 1, 2), f"debug_iter_{iteration:04d}_texture.png")
+
     
     print("-" * 60)
     print("Optimization complete!")
