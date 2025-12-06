@@ -75,7 +75,7 @@ class Config:
     ico_sphere_level = 4  # Higher = more subdivisions = smoother sphere
     
     # Optimization settings
-    num_iterations = 2000
+    num_iterations = 1000
     learning_rate = 0.05
     
     # SDS settings
@@ -89,7 +89,7 @@ class Config:
     max_elevation = 60.0    # degrees
     
     # Text prompt for texture generation
-    prompt = "a soccer ball, highly detailed, 8k, photorealistic"
+    prompt = "a tennis ball, highly detailed, 8k, photorealistic"
     negative_prompt = "blurry, low quality, distorted, ugly"
 
 
@@ -872,35 +872,52 @@ def main():
     # -------------------------------------------------------------------------
     print("\nSaving final texture...")
     
-    final_texture = torch.clamp(texture_map.detach(), 0.0, 1.0)
+    # [Fix] Clear memory to avoid OOM
+    del optimizer, scheduler, loss_total, loss_sds, loss_tv
+    if 'noise_pred' in locals(): del noise_pred
+    if 'noisy_latents' in locals(): del noisy_latents
+    torch.cuda.empty_cache()
+    
+    final_texture = texture_map.detach()
     
     # Save as image
     try:
         from torchvision.utils import save_image
-        # Permute to [1, 3, H, W] for save_image
-        texture_for_save = sdxl.decode_latents(final_texture.permute(0, 3, 1, 2))
-        save_image(texture_for_save, "final_texture.png")
+        # [Fix] Downsample latent texture before decoding to avoid OOM
+        # 1024x1024 latent -> 8192x8192 image (Too big!)
+        # Downsample to 128x128 latent -> 1024x1024 image
+        rgb_texture = visualize_latent_texture(sdxl, final_texture, target_res=128)
+        save_image(rgb_texture, "final_texture.png")
         print("Saved: final_texture.png")
     except ImportError:
         print("torchvision not available, skipping image save")
     
     # Save rendered views
     print("\nRendering final views...")
-    for i, azim in enumerate([0, 90, 180, 270]):
-        camera = renderer.create_camera(elevation=20.0, azimuth=azim)
-        mesh = create_textured_ico_sphere(
-            level=config.ico_sphere_level,
-            texture_map=final_texture,
-            device=config.device,
-        )
-        rendered = renderer.render(mesh, camera)
-        
-        try:
-            from torchvision.utils import save_image
-            save_image(rendered, f"final_view_{azim:03d}.png")
-            print(f"Saved: final_view_{azim:03d}.png")
-        except ImportError:
-            pass
+    
+    # Memory already cleared above
+    
+    with torch.no_grad():
+        final_bg = bg_latent.detach()
+        for i, azim in enumerate([0, 90, 180, 270]):
+            camera = renderer.create_camera(elevation=20.0, azimuth=azim)
+            mesh = create_textured_ico_sphere(
+                level=config.ico_sphere_level,
+                texture_map=final_texture,
+                device=config.device,
+            )
+            # Render returns (image, mask)
+            rendered_latent, mask = renderer.render(mesh, camera)
+            latents_composited = rendered_latent* mask + final_bg * (1 - mask)
+            # Decode to RGB for visualization
+            rendered_rgb = sdxl.decode_latents(latents_composited)
+            
+            try:
+                from torchvision.utils import save_image
+                save_image(rendered_rgb, f"final_view_{azim:03d}.png")
+                print(f"Saved: final_view_{azim:03d}.png")
+            except ImportError:
+                pass
     
     print("\nDone!")
     return texture_map
