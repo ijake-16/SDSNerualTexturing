@@ -18,6 +18,9 @@ import math
 import random
 from typing import Tuple
 
+import numpy as np
+import xatlas
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -40,6 +43,8 @@ from pytorch3d.renderer import (
     look_at_view_transform,
 )
 from pytorch3d.utils import ico_sphere
+
+
 
 def compute_tv_loss(img):
     """이미지의 가로/세로 인접 픽셀 차이를 계산 (매끄러움 강제)"""
@@ -64,17 +69,17 @@ class Config:
     
     # Texture settings
     texture_resolution = 1024  # UV texture map resolution
-    render_resolution = 512   # Rendered image resolution for SDS
+    render_resolution = 64   # Rendered image resolution for SDS
     
     # Mesh settings
     ico_sphere_level = 4  # Higher = more subdivisions = smoother sphere
     
     # Optimization settings
     num_iterations = 2000
-    learning_rate = 5e-3
+    learning_rate = 0.05
     
     # SDS settings
-    guidance_scale = 10.0   # CFG scale for SDS (Reduced from 100)
+    guidance_scale = 100.0   # CFG scale for SDS (Standard for Latent-NeRF)
     min_timestep = 200       # Minimum diffusion timestep
     max_timestep = 980      # Maximum diffusion timestep
     
@@ -485,6 +490,73 @@ class DifferentiableRenderer:
 # =============================================================================
 # Procedural Mesh Generation
 # =============================================================================
+# [2] PyTorch3D용 Flat Latent Shader (조명 제거)
+class FlatLatentShader(nn.Module):
+    def __init__(self, device="cpu", blend_params=None):
+        super().__init__()
+    
+    def forward(self, fragments, meshes, **kwargs):
+        # 텍스처 샘플링 (Lighting 연산 없이 텍스처 값 그대로 가져옴)
+        texels = meshes.sample_textures(fragments)
+        # texels shape: [batch, H, W, K, C] -> 여기서는 C=4 (Latent)
+        
+        # 단순히 픽셀의 첫 번째 값을 사용 (K=1인 경우)
+        images = texels[:, :, :, 0, :] 
+        return images
+
+# ... (기존 설정 코드들 Config, SD2Wrapper 등은 유지) ...
+
+# [3] Renderer 수정 (Shader 교체)
+class LatentRenderer:
+    def __init__(self, config: Config):
+        self.config = config
+        self.device = config.device
+        
+        # Latent 렌더링용 (64x64)
+        self.raster_settings = RasterizationSettings(
+            image_size=64, # ★ 중요: 64x64 해상도
+            blur_radius=0.0,
+            faces_per_pixel=1,
+            perspective_correct=True,
+            cull_backfaces=True,
+        )
+        
+        # 셰이더 교체: 빛(Lights)을 받지 않는 Flat Shader 사용
+        self.shader = FlatLatentShader(device=self.device)
+    
+    def create_camera(self, elevation: float, azimuth: float) -> FoVPerspectiveCameras:
+        """
+        Create a camera at the specified elevation and azimuth.
+        """
+        R, T = look_at_view_transform(
+            dist=self.config.camera_distance,
+            elev=elevation,
+            azim=azimuth,
+            device=self.device,
+        )
+        
+        camera = FoVPerspectiveCameras(
+            device=self.device,
+            R=R,
+            T=T,
+            fov=60.0,
+        )
+        
+        return camera
+        
+    def render(self, mesh, camera):
+        rasterizer = MeshRasterizer(
+            cameras=camera, 
+            raster_settings=self.raster_settings
+        )
+        
+        fragments = rasterizer(mesh)
+        images = self.shader(fragments, mesh) # [B, H, W, 4]
+        
+        # 마스크(알파 채널) 추출을 위해 래스터라이저 결과 활용
+        mask = fragments.pix_to_face > -1 # [B, H, W, 1]
+        
+        return images.permute(0, 3, 1, 2), mask.permute(0, 3, 1, 2).float()
 
 def create_textured_ico_sphere(
     level: int,
@@ -492,56 +564,46 @@ def create_textured_ico_sphere(
     device: torch.device,
 ) -> Meshes:
     """
-    Create an ico-sphere mesh with UV texture mapping.
-    
-    Args:
-        level: Subdivision level for ico_sphere
-        texture_map: Learnable texture tensor [1, H, W, 3]
-        device: Torch device
-        
-    Returns:
-        PyTorch3D Meshes object with UV texture
+    Create an ico-sphere mesh with UV texture mapping using xatlas.
     """
     # Generate ico-sphere
     mesh = ico_sphere(level=level, device=device)
     verts = mesh.verts_packed()
     faces = mesh.faces_packed()
     
-    # Generate UV coordinates using spherical mapping
-    # Normalize vertices to unit sphere
-    verts_normalized = F.normalize(verts, p=2, dim=1)
+    # Unwrap UVs using xatlas
+    v_np = verts.cpu().numpy()
+    f_np = faces.cpu().numpy()
     
-    # Spherical UV mapping
-    # u = 0.5 + atan2(z, x) / (2*pi)
-    # v = 0.5 - asin(y) / pi
-    x, y, z = verts_normalized[:, 0], verts_normalized[:, 1], verts_normalized[:, 2]
-    u = 0.5 + torch.atan2(z, x) / (2 * math.pi)
-    v = 0.5 - torch.asin(torch.clamp(y, -1.0, 1.0)) / math.pi
+    atlas = xatlas.Atlas()
+    atlas.add_mesh(v_np, f_np)
+    chart_options = xatlas.ChartOptions()
+    atlas.generate(chart_options=chart_options)
     
-    verts_uvs = torch.stack([u, v], dim=1)  # [V, 2]
+    vmapping, ft_np, vt_np = atlas[0]
     
-    # For simplicity, use per-vertex UVs (faces_uvs same as faces)
-    faces_uvs = faces
+    # Create new vertices (duplicated along seams)
+    new_verts = verts[vmapping]
+    
+    # Convert to torch
+    new_uvs = torch.from_numpy(vt_np.astype(np.float32)).to(device)
+    new_faces = torch.from_numpy(ft_np.astype(np.int64)).to(device)
     
     # Create texture
+    # Note: TexturesUV expects lists for batching
     textures = TexturesUV(
         maps=texture_map,        # [1, H, W, 3]
-        faces_uvs=[faces_uvs],   # List of [F, 3]
-        verts_uvs=[verts_uvs],   # List of [V, 2]
+        faces_uvs=[new_faces],   # List of [F, 3]
+        verts_uvs=[new_uvs],     # List of [V, 2]
+    )
+    # Create new Meshes object with re-indexed geometry
+    new_mesh = Meshes(
+        verts=[new_verts],
+        faces=[new_faces],
+        textures=textures
     )
     
-    # Create mesh with texture
-    mesh = Meshes(
-        verts=[verts],
-        faces=[faces],
-        textures=textures,
-    )
-    
-    # Explicitly set vertex normals for smooth shading
-    # We set the internal cache directly to ensure it's used
-    mesh._verts_normals_packed = verts_normalized
-    
-    return mesh
+    return new_mesh
 
 
 # =============================================================================
@@ -562,6 +624,26 @@ def sample_camera_position(config: Config) -> Tuple[float, float]:
     azimuth = random.uniform(0.0, 360.0)
     return elevation, azimuth
 
+def visualize_latent_texture(sdxl, texture_map, target_res=64):
+    """
+    거대한 Latent Texture(1024x1024)를 시각화하기 위해
+    작게 줄인 후 RGB로 변환합니다.
+    """
+    # 1. Downsample Latent (1024 -> 64)
+    # [1, 4, H, W]
+    small_latent = F.interpolate(
+        texture_map.permute(0, 3, 1, 2), 
+        size=(target_res, target_res), 
+        mode='bilinear', 
+        align_corners=False
+    )
+    
+    # 2. Decode to RGB
+    with torch.no_grad():
+        # 스케일링 복구 후 디코딩
+        rgb_img = sdxl.decode_latents(small_latent)
+        
+    return rgb_img
 
 def main():
     """Main function for neural texturing with SDS."""
@@ -591,36 +673,44 @@ def main():
     # -------------------------------------------------------------------------
     print("\nInitializing learnable texture map...")
     
-    # Initialize texture as green (tennis ball prior)
-    # Shape: [1, H, W, 3] for TexturesUV
-    texture_map = torch.ones(
-        1, 
-        config.texture_resolution, 
-        config.texture_resolution, 
-        3,
-        device=config.device,
-        dtype=torch.float32,
-    )*0.5
+    # [수정] VAE를 이용해 정확한 회색(0.5) Latent 생성
+    # Matrix Init은 SD 2.1과 호환되지 않으므로 VAE Init 사용
+    with torch.no_grad():
+        init_res = 512
+        gray_image = torch.ones(1, 3, init_res, init_res, device=config.device) * 0.5
+        gray_image = 2.0 * gray_image - 1.0
+        
+        latent_dist = sdxl.pipe.vae.encode(gray_image).latent_dist
+        target_latent = latent_dist.sample() * sdxl.vae_scale_factor
+        target_latent_mean = target_latent.mean(dim=[2, 3]) # [1, 4]
+        
+    print(f"Initialized Latent Mean (via VAE): {target_latent_mean}")
+
+    # [1, 1024, 1024, 4] 형태로 확장
+    texture_map = target_latent_mean.view(1, 1, 1, 4).repeat(1, config.texture_resolution, config.texture_resolution, 1)
     
-    
-    # Add small noise for initialization diversity
-    # texture_map = texture_map + torch.randn_like(texture_map) * 0.1
-    texture_map = torch.clamp(texture_map, 0.0, 1.0)
-    
-    # Make it a learnable parameter
+    # [수정] 노이즈 레벨 증가 (공식 코드: 0.3 * color + 0.4 * noise)
+    # VAE Init 값에 대해서도 동일하게 적용
+    texture_map = texture_map * 0.3 + torch.randn_like(texture_map) * 0.4
     texture_map = nn.Parameter(texture_map, requires_grad=True)
+
+    # 2. 배경색 초기화 (Latent Space Background)
+    # 배경도 학습 가능하게 설정
+    bg_latent = target_latent_mean.view(1, 4, 1, 1).clone()
+    bg_latent = nn.Parameter(bg_latent, requires_grad=True)
     
     # -------------------------------------------------------------------------
     # Step 3: Setup Renderer
     # -------------------------------------------------------------------------
     print("Setting up differentiable renderer...")
-    renderer = DifferentiableRenderer(config)
+    renderer = LatentRenderer(config)
     
     # -------------------------------------------------------------------------
     # Step 4: Setup Optimizer
     # -------------------------------------------------------------------------
     # optimizer = Adam([texture_map], lr=config.learning_rate)
-    optimizer = AdamW([texture_map], lr=config.learning_rate, weight_decay=0.0)
+    # [수정] 배경도 학습 대상에 포함
+    optimizer = AdamW([texture_map, bg_latent], lr=config.learning_rate, weight_decay=0.0)
     scheduler = CosineAnnealingLR(optimizer, T_max=config.num_iterations, eta_min=0.001)
     blurrer = GaussianBlur(kernel_size=(9, 9), sigma=(2.0, 2.0))
     # -------------------------------------------------------------------------
@@ -633,6 +723,11 @@ def main():
     gradient_verified = False
     
     for iteration in range(config.num_iterations):
+        # [Safety Check] Check for NaN in texture
+        if torch.isnan(texture_map).any():
+            print(f"!!! NaN detected in texture_map at iter {iteration} !!!")
+            break
+            
         optimizer.zero_grad()
         
         # ----- Camera Sampling -----
@@ -642,44 +737,27 @@ def main():
         
         # ----- Create Mesh with Current Texture -----
         # Clamp texture to valid range
-        texture_clamped = torch.clamp(texture_map, 0.0, 1.0)
-        # texture_flipped = torch.flip(texture_clamped, [1])
+        # texture_clamped = torch.clamp(texture_map, 0.0, 1.0)
+        # # texture_flipped = torch.flip(texture_clamped, [1])
         mesh = create_textured_ico_sphere(
             level=config.ico_sphere_level,
-            texture_map=texture_clamped,
+            texture_map=texture_map,
             device=config.device,
         )
         
         # ----- Render -----
         # rendered_image = renderer.render(mesh, camera)  # [1, 4, H, W]
-        rendered_image_raw = renderer.render(mesh, camera)
+        # 3. 렌더링 (인코딩 없이 4채널 출력)
+        pred_features, mask = renderer.render(mesh, camera) # [1, 4, 64, 64]
         
-        rgb = rendered_image_raw[:, :3, :, :]
-        mask = rendered_image_raw[:, 3:4, :, :]
-        bg_color = torch.tensor([0.5, 0.5, 0.5], device=config.device).view(1, 3, 1, 1)
-        rendered_image = rgb * mask + bg_color * (1 - mask)
-        # ----- SDS Loss Computation -----
-        # Encode rendered image to latents (with gradient tracking)
-        # IMPORTANT: We need gradients to flow from loss -> latents -> rendered_image -> texture
+        # 4. 배경 합성 (Latent Space에서 합성)
+        # 공식 코드는 mask 영역 밖을 bg_latent로 채움
+        latents = pred_features * mask + bg_latent * (1 - mask)
         
-        # Resize if needed (KEEP GRADIENTS - no torch.no_grad()!)
-        rendered_image_resized = F.interpolate(
-            rendered_image,
-            size=(Config.render_resolution,Config.render_resolution),
-            mode='bilinear',
-            align_corners=False,
-        )
-
-        # Normalize to [-1, 1] for VAE (keep gradients!)
-        rendered_for_vae = 2.0 * rendered_image_resized - 1.0
-        rendered_for_vae = rendered_for_vae.to(dtype=config.dtype).contiguous()
-        
-        # Encode to latents - use .mode() instead of .sample() for deterministic 
-        # encoding that properly passes gradients (sample() has stochastic issues)
-        latent_dist = sdxl.pipe.vae.encode(rendered_for_vae).latent_dist
-        # Use mean (mode) for deterministic gradient flow
-        latents = latent_dist.mean * sdxl.pipe.vae.config.scaling_factor
-        
+        # [수정] 이미 LINEAR_RGB_ESTIMATOR가 Scaled Latent를 반환하므로
+        # 여기서 다시 스케일링하면 값이 너무 작아짐 (Double Scaling 문제 해결)
+        latents_scaled = latents 
+        # latents_scaled = latents * sdxl.vae_scale_factor
         # Sample random timestep
         # TODO: Experiment with timestep sampling strategies
         timestep = random.randint(config.min_timestep, config.max_timestep)
@@ -690,7 +768,7 @@ def main():
         # timestep = random.randint(max(config.min_timestep, current_t - 200), current_t)
         
         # Compute SDS gradient (this is computed without gradients - it's our "target")
-        sds_grad, noise_pred, noisy_latents = sdxl.compute_sds_gradient(latents.detach(), timestep)
+        sds_grad, noise_pred, noisy_latents = sdxl.compute_sds_gradient(latents_scaled.detach(), timestep)
         sds_grad = sds_grad.to(dtype=torch.float32)
         # sds_grad = blurrer(sds_grad)  # Removed aggressive blur
         # ----- Backpropagation -----
@@ -713,8 +791,8 @@ def main():
         #     sds_grad = sds_grad / grad_mag  # Normalize to unit norm if too large
         
         # Apply a constant scale factor to control update size
-        sds_grad = sds_grad * 0.3  # Reduced scale to prevent noisy updates
-        loss_sds = (latents * sds_grad.detach()).sum()
+        sds_grad = sds_grad.detach()  # Reduced scale to prevent noisy updates
+        loss_sds = (latents_scaled * sds_grad.detach()).sum()
 
         # TV Loss 가중치 설정 (보통 0.01 ~ 0.1 사이, 노이즈가 심하면 키우세요)
         # tv_weight = 1e-5
@@ -724,7 +802,7 @@ def main():
         # loss = loss_tv
         optimizer.zero_grad() # 기울기 초기화
         # latents.backward(gradient=sds_grad, retain_graph=True)
-        tv_weight = 1e-5
+        tv_weight = 0
         loss_tv = compute_tv_loss(texture_map) * tv_weight
         loss_total = loss_tv+loss_sds
         loss_total.backward()
@@ -743,7 +821,7 @@ def main():
             else:
                 print("✗ WARNING: No gradients flowing to texture! Check the computation graph.")
                 print(f"  - rendered_image requires_grad: {rendered_image.requires_grad}")
-                print(f"  - latents requires_grad: {latents.requires_grad}")
+                print(f"  - latents requires_grad: {latents_scaled.requires_grad}")
         
         # ----- Optimizer Step -----
         # optimizer.step()
@@ -770,7 +848,7 @@ def main():
                 # 1. 현재 렌더링된 모습 (VAE가 잘 동작하는지 확인)
                 # 3D 렌더러 -> VAE Encode -> VAE Decode 과정을 거친 이미지
                 # 이게 노이즈라면 렌더러나 VAE 입력 범위(-1~1) 문제
-                current_view_img = sdxl.decode_latents(latents.detach())
+                current_view_img = visualize_latent_texture(sdxl, texture_map, target_res=128)
                 
                 # 2. AI가 상상하는 목표 모습 (x0 prediction)
                 # "이 노이즈를 제거하면 이런 얼굴이 될 거야"라고 모델이 생각하는 이미지
@@ -800,7 +878,7 @@ def main():
     try:
         from torchvision.utils import save_image
         # Permute to [1, 3, H, W] for save_image
-        texture_for_save = final_texture.permute(0, 3, 1, 2)
+        texture_for_save = sdxl.decode_latents(final_texture.permute(0, 3, 1, 2))
         save_image(texture_for_save, "final_texture.png")
         print("Saved: final_texture.png")
     except ImportError:
