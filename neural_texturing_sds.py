@@ -312,7 +312,7 @@ class DifferentiableRenderer:
         
         return camera
     
-    def render(self, mesh: Meshes, camera: FoVPerspectiveCameras) -> torch.Tensor:
+    def render(self, mesh: Meshes, camera: FoVPerspectiveCameras) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Render the mesh from the given camera viewpoint.
         
@@ -321,31 +321,34 @@ class DifferentiableRenderer:
             camera: Camera for rendering
             
         Returns:
-            Rendered image tensor [1, 3, H, W] in range [0, 1]
+            Rendered image tensor [B, 3, H, W] in range [0, 1]
+            Alpha mask tensor [B, 1, H, W] where 1 = geometry, 0 = background
         """
-        # Create renderer with current camera
-        renderer = MeshRenderer(
-            rasterizer=MeshRasterizer(
-                cameras=camera,
-                raster_settings=self.raster_settings,
-            ),
-            shader=SoftPhongShader(
-                device=self.device,
-                cameras=camera,
-                lights=self.lights,
-            ),
+        # Build rasterizer and shader separately so we can access fragments (for alpha)
+        rasterizer = MeshRasterizer(
+            cameras=camera,
+            raster_settings=self.raster_settings,
         )
-        
-        # Render
-        images = renderer(mesh)  # [B, H, W, 4] (RGBA)
-        
+        fragments = rasterizer(mesh)
+
+        # Alpha mask: where a face is hit (pix_to_face >= 0)
+        alpha = (fragments.pix_to_face[..., 0] >= 0).float()  # [B, H, W]
+        alpha = alpha.unsqueeze(1)  # [B, 1, H, W]
+
+        shader = SoftPhongShader(
+            device=self.device,
+            cameras=camera,
+            lights=self.lights,
+        )
+        images = shader(fragments, mesh)  # [B, H, W, 4] (RGBA)
+
         # Extract RGB and transpose to [B, 3, H, W]
         images = images[..., :3].permute(0, 3, 1, 2)
-        
+
         # Clamp to valid range
         images = torch.clamp(images, 0.0, 1.0)
-        
-        return images
+
+        return images, alpha
 
 
 # =============================================================================
@@ -509,7 +512,12 @@ def main():
         )
         
         # ----- Render -----
-        rendered_image = renderer.render(mesh, camera)  # [1, 3, H, W]
+        rendered_image, alpha = renderer.render(mesh, camera)  # rendered_image: [1, 3, H, W], alpha: [1, 1, H, W]
+
+        # ----- Background Handling -----
+        # Solution 2: Randomized background to prevent background bleeding
+        bg_color = torch.rand(1, 3, 1, 1, device=config.device)
+        rendered_image = rendered_image * alpha + bg_color * (1.0 - alpha)
         
         # ----- SDS Loss Computation -----
         # Encode rendered image to latents (with gradient tracking)
@@ -542,6 +550,12 @@ def main():
         
         # Compute SDS gradient (this is computed without gradients - it's our "target")
         sds_grad = sdxl.compute_sds_gradient(latents.detach(), timestep)
+
+        # Apply alpha mask to SDS gradient to avoid background bleeding
+        alpha_latents = F.interpolate(
+            alpha, size=latents.shape[-2:], mode="bilinear", align_corners=False
+        )
+        sds_grad = sds_grad * alpha_latents
         
         # ----- Backpropagation -----
         # SDS gradient update: we want to move latents in the direction of sds_grad
